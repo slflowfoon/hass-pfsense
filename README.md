@@ -102,6 +102,13 @@ entries (sysctl `net.link.ether.inet.max_age`). You may lower that using
 - dhcp stats (total, online, and offline clients)
 - OpenVPN server stats (per-server basis - connected client count, bytes
   sent/received, kB/s sent/received)
+- OpenVPN client stats (per-client basis - status, bytes sent/received, kB/s
+  sent/received; attributes: `vpnid`, `name`, `caref`, `server_addr`,
+  `server_port`, `protocol`, `connect_time`)
+- CA certificate expiry (days until expiry per CA certificate; negative =
+  already expired; icon changes to `certificate-alert` within 30 days and
+  `certificate-outline` when expired; attributes: `expires_at`, `subject_cn`,
+  `issuer_cn`, `serial`)
 
 ## switch
 
