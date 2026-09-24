@@ -6,16 +6,42 @@ likely via some sort of mutex.
 import json
 import logging
 import re
-import socket
 import ssl
 from urllib.parse import quote_plus, urlparse
 from xml.parsers.expat import ExpatError
 import xmlrpc.client
 
-# value to set as the socket timeout
+# Per-connection read timeouts; firmware metadata may refresh a cold server cache.
 DEFAULT_TIMEOUT = 10
+FIRMWARE_UPDATE_TIMEOUT = 90
 
 _LOGGER = logging.getLogger(__name__)
+
+
+class TimeoutTransport(xmlrpc.client.Transport):
+    """HTTP transport with a connection-local timeout."""
+
+    def __init__(self, timeout):
+        super().__init__()
+        self._timeout = timeout
+
+    def make_connection(self, host):
+        connection = super().make_connection(host)
+        connection.timeout = self._timeout
+        return connection
+
+
+class TimeoutSafeTransport(xmlrpc.client.SafeTransport):
+    """HTTPS transport preserving the configured TLS verification policy."""
+
+    def __init__(self, timeout, context=None):
+        super().__init__(context=context)
+        self._timeout = timeout
+
+    def make_connection(self, host):
+        connection = super().make_connection(host)
+        connection.timeout = self._timeout
+        return connection
 
 
 def dict_get(data: dict, path: str, default=None):
@@ -71,7 +97,7 @@ class Client(object):
         self._url_parts = urlparse(self._url)
 
     # https://stackoverflow.com/questions/64983392/python-multiple-patch-gives-http-client-cannotsendrequest-request-sent
-    def _get_proxy(self):
+    def _get_proxy(self, timeout=DEFAULT_TIMEOUT):
         # https://docs.python.org/3/library/xmlrpc.client.html#module-xmlrpc.client
         # https://stackoverflow.com/questions/30461969/disable-default-certificate-verification-in-python-2-7-9
         context = None
@@ -85,22 +111,15 @@ class Client(object):
         # set to True if necessary during development
         verbose = False
 
-        proxy = xmlrpc.client.ServerProxy(self._url, context=context, verbose=verbose)
+        if self._url_parts.scheme == "https":
+            transport = TimeoutSafeTransport(timeout, context=context)
+        else:
+            transport = TimeoutTransport(timeout)
+
+        proxy = xmlrpc.client.ServerProxy(
+            self._url, transport=transport, verbose=verbose
+        )
         return proxy
-
-    def _apply_timeout(func):
-        def inner(*args, **kwargs):
-            response = None
-            # timout applies to each recv() call, not the whole request
-            default_timeout = socket.getdefaulttimeout()
-            try:
-                socket.setdefaulttimeout(DEFAULT_TIMEOUT)
-                response = func(*args, **kwargs)
-            finally:
-                socket.setdefaulttimeout(default_timeout)
-            return response
-
-        return inner
 
     def _log_errors(func):
         def inner(*args, **kwargs):
@@ -112,19 +131,18 @@ class Client(object):
 
         return inner
 
-    @_apply_timeout
     def _get_config_section(self, section):
-        response = self._get_proxy().pfsense.backup_config_section([section])
+        with self._get_proxy() as proxy:
+            response = proxy.pfsense.backup_config_section([section])
         return response[section]
 
-    @_apply_timeout
     def _restore_config_section(self, section_name, data):
         params = {section_name: data}
-        response = self._get_proxy().pfsense.restore_config_section(params, 60)
+        with self._get_proxy() as proxy:
+            response = proxy.pfsense.restore_config_section(params, 60)
         return response
 
-    @_apply_timeout
-    def _exec_php(self, script):
+    def _exec_php(self, script, timeout=DEFAULT_TIMEOUT):
         script = """
 ini_set('display_errors', 0);
 
@@ -138,7 +156,8 @@ $toreturn["real"] = json_encode($toreturn_real);
 """.format(
             script
         )
-        response = self._get_proxy().pfsense.exec_php(script)
+        with self._get_proxy(timeout=timeout) as proxy:
+            response = proxy.pfsense.exec_php(script)
         response = json.loads(response["real"])
         return response
 
@@ -156,7 +175,8 @@ $toreturn["real"] = json_encode($toreturn_real);
 """.format(
             script
         )
-        response = self._get_proxy().pfsense.exec_php(script)
+        with self._get_proxy(timeout=None) as proxy:
+            response = proxy.pfsense.exec_php(script)
         response = json.loads(response["real"])
         return response
 
@@ -179,12 +199,11 @@ $toreturn = [
         response = self._exec_php(script)
         return response["data"]
 
-    @_apply_timeout
     @_log_errors
     def get_host_firmware_version(self):
-        return self._get_proxy().pfsense.host_firmware_version(1, 60)
+        with self._get_proxy() as proxy:
+            return proxy.pfsense.host_firmware_version(1, 60)
 
-    @_log_errors
     def get_firmware_update_info(self):
         """
         # the cache is 2 hours
@@ -210,7 +229,7 @@ $toreturn = [
     ]
 ];
 """
-        response = self._exec_php(script)
+        response = self._exec_php(script, timeout=FIRMWARE_UPDATE_TIMEOUT)
         return response["data"]
 
     @_log_errors
@@ -1251,7 +1270,7 @@ global $config;
 global $g;
 
 function stripalpha($s) {
-  return preg_replace("/\D/", "", $s);
+  return preg_replace("/\\D/", "", $s);
 }
 
 $mbuf = null;

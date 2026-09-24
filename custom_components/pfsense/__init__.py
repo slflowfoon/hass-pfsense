@@ -7,6 +7,7 @@ from datetime import timedelta
 import logging
 import math
 import re
+from threading import Lock
 import time
 from typing import Callable
 
@@ -218,6 +219,8 @@ class PfSenseData:
         self._hass = hass
         self._state = {}
         self._firmware_update_info = None
+        self._firmware_update_lock = Lock()
+        self._firmware_update_timed_out = False
         self._background_tasks = set()
 
     @property
@@ -242,15 +245,27 @@ class PfSenseData:
 
     @_log_timing
     def _refresh_firmware_update_info(self):
+        # A cold-cache lookup can outlast the normal polling interval.
+        if not self._firmware_update_lock.acquire(blocking=False):
+            return
+
         try:
             self._firmware_update_info = self._client.get_firmware_update_info()
-
-        except BaseException as err:
-            # can take some time to refresh data
-            # will catch it the next cycle likely
-            if "timed out" in str(err):
-                return
-            raise err
+        except TimeoutError:
+            if not self._firmware_update_timed_out:
+                _LOGGER.warning(
+                    "pfSense firmware check timed out; retaining the last result "
+                    "and retrying on a later poll"
+                )
+                self._firmware_update_timed_out = True
+        except Exception:
+            _LOGGER.exception("Failed to retrieve pfSense firmware update information")
+        else:
+            if self._firmware_update_timed_out:
+                _LOGGER.info("pfSense firmware checks have recovered")
+            self._firmware_update_timed_out = False
+        finally:
+            self._firmware_update_lock.release()
 
     @_log_timing
     def _get_firmware_update_info(self):

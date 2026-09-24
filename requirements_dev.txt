@@ -3,3 +3,4 @@ homeassistant
 isort
 mac_vendor_lookup
 async-timeout
+pytest
